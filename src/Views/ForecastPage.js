@@ -1,10 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import { useNavigate } from 'react-router-dom';
 import '../styles/ForecastPage.css';
 
 const Forecast = () => {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [showLoginModal, setShowLoginModal] = useState(false);
   const [city, setCity] = useState('');
   const [countryCode, setCountryCode] = useState('');
   const [forecastData, setForecastData] = useState(null);
@@ -12,8 +11,70 @@ const Forecast = () => {
   const [error, setError] = useState('');
   const [recentSearches, setRecentSearches] = useState([]);
   const [selectedDay, setSelectedDay] = useState('all');
-
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [userProfile, setUserProfile] = useState(null);
   
+  const navigate = useNavigate();
+
+  // Get token from localStorage (matching your login page)
+  const getToken = () => {
+    return localStorage.getItem('jwtToken');
+  };
+
+  // Get user profile from localStorage
+  const getUserProfile = () => {
+    const profile = localStorage.getItem('userProfile');
+    return profile ? JSON.parse(profile) : null;
+  };
+
+  // Check if user is authenticated
+  useEffect(() => {
+    const token = getToken();
+    const profile = getUserProfile();
+    setIsAuthenticated(!!token);
+    setUserProfile(profile);
+  }, []);
+
+  // Configure axios interceptor to include token in requests
+  useEffect(() => {
+    const interceptor = axios.interceptors.request.use(
+      (config) => {
+        const token = getToken();
+        if (token) {
+          config.headers.Authorization = `Bearer ${token}`;
+        }
+        return config;
+      },
+      (error) => {
+        return Promise.reject(error);
+      }
+    );
+
+    return () => {
+      axios.interceptors.request.eject(interceptor);
+    };
+  }, []);
+
+  // Handle axios errors (especially 401 Unauthorized)
+  useEffect(() => {
+    const interceptor = axios.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        if (error.response?.status === 401) {
+          // Token expired or invalid
+          handleLogout();
+          setError('Your session has expired. Please log in again.');
+        } else if (error.response?.status === 403) {
+          setError('Access denied. You do not have permission to perform this action.');
+        }
+        return Promise.reject(error);
+      }
+    );
+
+    return () => {
+      axios.interceptors.response.eject(interceptor);
+    };
+  }, []);
 
   useEffect(() => {
     const savedSearches = localStorage.getItem('recentWeatherSearches');
@@ -26,14 +87,14 @@ const Forecast = () => {
     localStorage.setItem('recentWeatherSearches', JSON.stringify(recentSearches));
   }, [recentSearches]);
 
-  // Helper function to properly encode URLs
- // Remove the + replacement and use standard encoding
-const encodeURL = (str) => {
-  return encodeURIComponent(str);
-};
-
   const handleSearch = async (e) => {
     e.preventDefault();
+    
+    if (!isAuthenticated) {
+      setError('Please log in to access weather forecasts');
+      return;
+    }
+
     if (!city.trim()) {
       setError('Please enter a city name');
       return;
@@ -45,31 +106,32 @@ const encodeURL = (str) => {
     setSelectedDay('all');
    
     try {
-      const encodedCity = encodeURL(city);
-      const encodedCountry = countryCode || 'ZA';
-      
-      console.log('Searching for 5-day forecast:', city, '->', encodedCity, encodedCountry);
+      console.log('Searching for 5-day forecast:', city, countryCode);
      
       // First, try to get existing data from our database
       try {
         const response = await axios.get(
-          `http://localhost:8080/api/forecast/city/${encodedCity}/country/${encodedCountry}`
+          `http://localhost:8080/api/forecast/city/${encodeURIComponent(city)}/country/${countryCode || 'ZA'}`
         );
        
         if (response.data && response.data.length > 0) {
           console.log('Found existing data in database:', response.data.length, 'entries');
           setForecastData(response.data);
-          addToRecentSearches(city, encodedCountry);
+          addToRecentSearches(city, countryCode);
           return;
         }
       } catch (getError) {
-        console.log('No existing data found, will fetch from API');
+        if (getError.response?.status === 404) {
+          console.log('No existing data found, will fetch from API');
+        } else {
+          throw getError;
+        }
       }
      
       // If no existing data, fetch from OpenWeatherMap API
       console.log('Fetching 5-day forecast from OpenWeatherMap API...');
       const createResponse = await axios.post(
-        `http://localhost:8080/api/forecast/fetch/${encodedCity}/${encodedCountry}`
+        `http://localhost:8080/api/forecast/fetch/${encodeURIComponent(city)}/${countryCode}`
       );
      
       if (createResponse.data && createResponse.data.length > 0) {
@@ -77,12 +139,12 @@ const encodeURL = (str) => {
        
         // Now get the saved data from our database
         const response = await axios.get(
-          `http://localhost:8080/api/forecast/city/${encodedCity}/country/${encodedCountry}`
+          `http://localhost:8080/api/forecast/city/${encodeURIComponent(city)}/country/${countryCode}`
         );
        
         if (response.data && response.data.length > 0) {
           setForecastData(response.data);
-          addToRecentSearches(city, encodedCountry);
+          addToRecentSearches(city, countryCode);
         } else {
           setError('No forecast data found for this location.');
         }
@@ -91,22 +153,43 @@ const encodeURL = (str) => {
       }
     } catch (err) {
       console.error('Error fetching forecast:', err);
-      if (err.response) {
-        // Server responded with error status
-        if (err.response.status === 404) {
-          setError(`City "${city}" not found. Please check the spelling.`);
-        } else if (err.response.status === 500) {
-          setError(`Server error while fetching data for "${city}". Please try again.`);
-        } else {
-          setError(`Error: ${err.response.status} - ${err.response.data || 'Failed to fetch forecast'}`);
-        }
-      } else if (err.request) {
-        setError('Network error. Please check if the server is running.');
+      if (err.response?.status === 403) {
+        setError('You do not have permission to fetch new weather data. Please contact an administrator.');
+      } else if (err.response?.status === 401) {
+        setError('Please log in to access weather forecasts');
+      } else if (err.response?.data) {
+        setError(err.response.data);
       } else {
-        setError('An unexpected error occurred.');
+        setError('Failed to fetch weather data. Please try again.');
       }
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleLoginRedirect = () => {
+    navigate('/login');
+  };
+
+  const handleLogout = () => {
+    // Clear all user data from localStorage
+    localStorage.removeItem('jwtToken');
+    localStorage.removeItem('userProfile');
+    
+    // Reset state
+    setIsAuthenticated(false);
+    setUserProfile(null);
+    setForecastData(null);
+    
+    // Navigate to home page
+    navigate('/');
+  };
+
+  const handleDashboardRedirect = () => {
+    if (userProfile?.role === 'ADMIN') {
+      navigate('/admin-dashboard');
+    } else {
+      navigate('/dashboard');
     }
   };
 
@@ -162,6 +245,11 @@ const encodeURL = (str) => {
   };
 
   const handleRecentSearch = (searchTerm) => {
+    if (!isAuthenticated) {
+      setError('Please log in to access weather forecasts');
+      return;
+    }
+
     const parts = searchTerm.split(', ');
     setCity(parts[0]);
     if (parts.length > 1) {
@@ -169,16 +257,6 @@ const encodeURL = (str) => {
     } else {
       setCountryCode('ZA');
     }
-  };
-
-  const handleQuickSearch = (testCity, testCountry) => {
-    setCity(testCity);
-    setCountryCode(testCountry);
-    // Trigger search after a short delay to allow state update
-    setTimeout(() => {
-      const fakeEvent = { preventDefault: () => {} };
-      handleSearch(fakeEvent);
-    }, 100);
   };
 
   const formatDate = (dateString) => {
@@ -206,13 +284,13 @@ const encodeURL = (str) => {
   };
 
   const getWeatherIcon = (condition) => {
-    if (!condition) return '🌤️';
+    if (!condition) return '🌤';
    
     const conditionMap = {
-      'clear': '☀️', 'clouds': '☁️', 'rain': '🌧️', 'drizzle': '🌦️',
-      'thunderstorm': '⛈️', 'snow': '❄️', 'mist': '🌫️', 'smoke': '🌫️',
-      'haze': '🌫️', 'dust': '🌫️', 'fog': '🌫️', 'sand': '🌫️',
-      'ash': '🌫️', 'squall': '💨', 'tornado': '🌪️'
+      'clear': '☀', 'clouds': '☁', 'rain': '🌧', 'drizzle': '🌦',
+      'thunderstorm': '⛈', 'snow': '❄', 'mist': '🌫', 'smoke': '🌫',
+      'haze': '🌫', 'dust': '🌫', 'fog': '🌫', 'sand': '🌫',
+      'ash': '🌫', 'squall': '💨', 'tornado': '🌪'
     };
    
     const lowerCondition = condition.toLowerCase();
@@ -221,20 +299,8 @@ const encodeURL = (str) => {
         return conditionMap[key];
       }
     }
-    return '🌤️';
+    return '🌤';
   };
-
-  const testCities = [
-    { city: 'London', country: 'GB' },
-    { city: 'Paris', country: 'FR' },
-    { city: 'New York', country: 'US' },
-    { city: 'Tokyo', country: 'JP' },
-    { city: 'Cape Town', country: 'ZA' },
-    { city: 'Johannesburg', country: 'ZA' },
-    { city: 'Durban', country: 'ZA' },
-    { city: 'Port Elizabeth', country: 'ZA' },
-    { city: 'East London', country: 'ZA' }
-  ];
 
   const filteredForecasts = getFilteredForecasts();
   const availableDays = getAvailableDays();
@@ -242,92 +308,118 @@ const encodeURL = (str) => {
 
   return (
     <div className="forecast-container">
-      <h1>Weather Forecast</h1>
-     
-      {/* Quick Search Buttons */}
-      <div className="quick-search">
-        <h3>Quick Search:</h3>
-        <div className="quick-search-buttons">
-          {testCities.map((testCity, index) => (
-            <button
-              key={index}
-              className="quick-search-btn"
-              onClick={() => handleQuickSearch(testCity.city, testCity.country)}
-              disabled={loading}
-            >
-              {testCity.city}
+      {/* Authentication Status Header */}
+      <div className="auth-header">
+        {isAuthenticated ? (
+          <div className="auth-status">
+            <span className="auth-badge">
+              🔐 Welcome, {userProfile?.firstName || userProfile?.username || 'User'} 
+              {userProfile?.role === 'ADMIN' && ' (Admin)'}
+            </span>
+            <button onClick={handleDashboardRedirect} className="dashboard-btn">
+              Dashboard
             </button>
-          ))}
-        </div>
+            <button onClick={handleLogout} className="logout-btn">
+              Logout
+            </button>
+          </div>
+        ) : (
+          <div className="auth-status">
+            <span className="auth-warning">⚠️ Not Logged In</span>
+            <button onClick={handleLoginRedirect} className="login-btn">
+              Login
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Search form */}
-      <form onSubmit={handleSearch} className="search-form">
-        <div className="input-group">
-          <input
-            type="text"
-            placeholder="Enter city name (e.g., Cape Town, New York)"
-            value={city}
-            onChange={(e) => setCity(e.target.value)}
-            required
-            disabled={loading}
-          />
-          <input
-            type="text"
-            placeholder="Country code (ZA)"
-            value={countryCode}
-            onChange={(e) => setCountryCode(e.target.value.toUpperCase())}
-            style={{ width: '120px' }}
-            disabled={loading}
-            maxLength={2}
-          />
-          <button type="submit" disabled={loading}>
-            {loading ? '⏳ Loading...' : '🔍 Get 5-Day Forecast'}
-          </button>
-        </div>
-      </form>
-
-      {/* Error Display */}
-      {error && (
-        <div className="error-message">
-          <p>❌ {error}</p>
+      <div className="forecast-header">
+        <h1>🌤️ Weather Forecast</h1>
+        <p>Get detailed 5-day weather forecasts for any city worldwide</p>
+      </div>
+     
+      {!isAuthenticated && (
+        <div className="login-prompt">
+          <p>Please log in to access weather forecasts and features.</p>
         </div>
       )}
 
-      {/* Recent Searches */}
-      {recentSearches.length > 0 && (
-        <div className="recent-searches">
-          <h3>Recent Searches:</h3>
-          <div className="recent-buttons">
-            {recentSearches.map((search, index) => (
-              <button
-                key={index}
-                className="recent-btn"
-                onClick={() => handleRecentSearch(search)}
-                disabled={loading}
-              >
-                {search}
-              </button>
-            ))}
+      {/* Search form */}
+      <div className="search-section">
+        <form onSubmit={handleSearch} className="search-form">
+          <div className="input-group">
+            <div className="input-wrapper">
+              <label>City Name</label>
+              <input
+                type="text"
+                placeholder="e.g., Cape Town, London, Tokyo"
+                value={city}
+                onChange={(e) => setCity(e.target.value)}
+                required
+                disabled={loading || !isAuthenticated}
+              />
+            </div>
+            <div className="input-wrapper">
+              <label>Country Code</label>
+              <input
+                type="text"
+                placeholder="ZA, US, GB, etc."
+                value={countryCode}
+                onChange={(e) => setCountryCode(e.target.value.toUpperCase())}
+                disabled={loading || !isAuthenticated}
+              />
+            </div>
+            <button 
+              type="submit" 
+              disabled={loading || !isAuthenticated}
+              className={`search-btn ${!isAuthenticated ? 'disabled-btn' : ''}`}
+            >
+              {loading ? (
+                <>
+                  <span className="spinner"></span>
+                  Loading...
+                </>
+              ) : (
+                <>
+                  <span className="search-icon">🔍</span>
+                  Get Forecast
+                </>
+              )}
+            </button>
           </div>
+        </form>
+      </div>
+
+      {/* Error messages */}
+      {error && (
+        <div className={`error-message ${error.includes('logged out') ? 'info-message' : ''}`}>
+          <div className="error-content">
+            <span className="error-icon">⚠️</span>
+            <span>{error}</span>
+          </div>
+          {error.includes('Please log in') && (
+            <button onClick={handleLoginRedirect} className="inline-login-btn">
+              Login Now
+            </button>
+          )}
         </div>
       )}
 
       {/* Day selection filter */}
       {forecastData && forecastData.length > 0 && (
-        <div className="day-filter">
-          <h3>Select Day:</h3>
+        <div className="day-filter-section">
+          <h3>📅 Filter by Day</h3>
           <div className="day-buttons">
             <button
-              className={selectedDay === 'all' ? 'active' : ''}
+              className={`day-btn ${selectedDay === 'all' ? 'active' : ''}`}
               onClick={() => setSelectedDay('all')}
             >
-              All Days
+              📊 All Days
             </button>
             {availableDays.map((day, index) => (
               <button
                 key={index}
-                className={selectedDay === day ? 'active' : ''}
+                className={`day-btn ${selectedDay === day ? 'active' : ''}`}
                 onClick={() => setSelectedDay(day)}
               >
                 {formatDay(day)}
@@ -340,30 +432,73 @@ const encodeURL = (str) => {
       {/* Forecast display */}
       {filteredForecasts && filteredForecasts.length > 0 && (
         <div className="forecast-results">
-          <h2>5-Day Forecast for {filteredForecasts[0].city}</h2>
+          <div className="results-header">
+            <h2>
+              {getWeatherIcon(filteredForecasts[0].condition)} 
+              5-Day Forecast for <b>{filteredForecasts[0].city}</b>
+            </h2>
+            <div className="results-count">
+              {filteredForecasts.length} forecast{filteredForecasts.length !== 1 ? 's' : ''} shown
+            </div>
+          </div>
          
           {selectedDay === 'all' ? (
-            // Show grouped by day
-            <div className="forecast-days">
+            // Show grouped by day in grid layout
+            <div className="forecast-grid-container">
               {Object.entries(forecastsByDay).map(([day, dayForecasts]) => (
-                <div key={day} className="forecast-day">
-                  <h3>{formatDay(day)}</h3>
-                  <div className="forecast-cards">
+                <div key={day} className="day-section">
+                  <h3 className="day-header">{formatDay(day)}</h3>
+                  <div className="forecast-grid">
                     {dayForecasts.map((forecast, index) => (
                       <div key={index} className="forecast-card">
                         <div className="card-header">
-                          <h4>{formatDate(forecast.forecastTime)}</h4>
-                          <span className="weather-icon">{getWeatherIcon(forecast.condition)}</span>
-                        </div>
-                        <div className="temperature">
-                          <span className="main-temp">{Math.round(forecast.temperature)}°C</span>
-                          <div className="temp-details">
-                            <span>Feels like: {Math.round(forecast.feelsLike)}°C</span>
+                          <div className="time-badge">
+                            {new Date(forecast.forecastTime).toLocaleTimeString('en-US', {
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              hour12: true
+                            })}
+                          </div>
+                          <div className="weather-icon-large">
+                            {getWeatherIcon(forecast.condition)}
                           </div>
                         </div>
-                        <div className="weather-details">
-                          <p className="condition">{forecast.condition}</p>
-                          <p className="description">{forecast.description}</p>
+                        
+                        <div className="temperature-section">
+                          <div className="main-temp">
+                            {Math.round(forecast.temperature)}°C
+                          </div>
+                          <div className="feels-like">
+                            Feels like {Math.round(forecast.feelsLike)}°C
+                          </div>
+                        </div>
+
+                        <div className="weather-condition">
+                          <div className="condition">{forecast.condition}</div>
+                          <div className="description">{forecast.description}</div>
+                        </div>
+
+                        <div className="weather-details-grid">
+                          <div className="detail-item">
+                            <span className="detail-icon">⬇️</span>
+                            <span className="detail-label">Min</span>
+                            <span className="detail-value">{Math.round(forecast.minTemperature)}°C</span>
+                          </div>
+                          <div className="detail-item">
+                            <span className="detail-icon">⬆️</span>
+                            <span className="detail-label">Max</span>
+                            <span className="detail-value">{Math.round(forecast.maxTemperature)}°C</span>
+                          </div>
+                          <div className="detail-item">
+                            <span className="detail-icon">💧</span>
+                            <span className="detail-label">Humidity</span>
+                            <span className="detail-value">{forecast.humidity}%</span>
+                          </div>
+                          <div className="detail-item">
+                            <span className="detail-icon">💨</span>
+                            <span className="detail-label">Wind</span>
+                            <span className="detail-value">{forecast.windSpeed} m/s</span>
+                          </div>
                         </div>
                       </div>
                     ))}
@@ -372,36 +507,97 @@ const encodeURL = (str) => {
               ))}
             </div>
           ) : (
-            // Show single day
-            <div className="forecast-cards">
+            // Show single day in detailed grid
+            <div className="forecast-grid detailed-view">
               {filteredForecasts.map((forecast, index) => (
-                <div key={index} className="forecast-card">
+                <div key={index} className="forecast-card detailed-card">
                   <div className="card-header">
-                    <h3>{formatDate(forecast.forecastTime)}</h3>
-                    <span className="weather-icon">{getWeatherIcon(forecast.condition)}</span>
-                  </div>
-                  <div className="temperature">
-                    <span className="main-temp">{Math.round(forecast.temperature)}°C</span>
-                    <div className="temp-details">
-                      <span>Feels like: {Math.round(forecast.feelsLike)}°C</span>
-                      <span>Min: {Math.round(forecast.minTemperature)}°C</span>
-                      <span>Max: {Math.round(forecast.maxTemperature)}°C</span>
+                    <div className="time-section">
+                      <div className="time-badge large">
+                        {new Date(forecast.forecastTime).toLocaleTimeString('en-US', {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          hour12: true
+                        })}
+                      </div>
+                      <div className="date-small">
+                        {new Date(forecast.forecastTime).toLocaleDateString('en-US', {
+                          weekday: 'short',
+                          month: 'short',
+                          day: 'numeric'
+                        })}
+                      </div>
+                    </div>
+                    <div className="weather-icon-xlarge">
+                      {getWeatherIcon(forecast.condition)}
                     </div>
                   </div>
-                  <div className="weather-details">
-                    <p className="condition">{forecast.condition} - {forecast.description}</p>
-                    <div className="details-grid">
-                      <div className="detail-item">
-                        <span>💧 Humidity:</span>
-                        <span>{forecast.humidity}%</span>
+                  
+                  <div className="temperature-section">
+                    <div className="main-temp large">
+                      {Math.round(forecast.temperature)}°C
+                    </div>
+                    <div className="temp-range">
+                      <span className="temp-min">L: {Math.round(forecast.minTemperature)}°C</span>
+                      <span className="temp-max">H: {Math.round(forecast.maxTemperature)}°C</span>
+                    </div>
+                    <div className="feels-like">
+                      Feels like {Math.round(forecast.feelsLike)}°C
+                    </div>
+                  </div>
+
+                  <div className="weather-condition">
+                    <div className="condition main">{forecast.condition}</div>
+                    <div className="description">{forecast.description}</div>
+                  </div>
+
+                  <div className="weather-details-grid expanded">
+                    <div className="detail-row">
+                      <div className="detail-item expanded">
+                        <span className="detail-icon">💧</span>
+                        <div className="detail-info">
+                          <span className="detail-label">Humidity</span>
+                          <span className="detail-value">{forecast.humidity}%</span>
+                        </div>
                       </div>
-                      <div className="detail-item">
-                        <span>📊 Pressure:</span>
-                        <span>{forecast.pressure}hPa</span>
+                      <div className="detail-item expanded">
+                        <span className="detail-icon">📊</span>
+                        <div className="detail-info">
+                          <span className="detail-label">Pressure</span>
+                          <span className="detail-value">{forecast.pressure} hPa</span>
+                        </div>
                       </div>
-                      <div className="detail-item">
-                        <span>💨 Wind:</span>
-                        <span>{forecast.windSpeed}m/s</span>
+                    </div>
+                    <div className="detail-row">
+                      <div className="detail-item expanded">
+                        <span className="detail-icon">💨</span>
+                        <div className="detail-info">
+                          <span className="detail-label">Wind Speed</span>
+                          <span className="detail-value">{forecast.windSpeed} m/s</span>
+                        </div>
+                      </div>
+                      <div className="detail-item expanded">
+                        <span className="detail-icon">🧭</span>
+                        <div className="detail-info">
+                          <span className="detail-label">Wind Direction</span>
+                          <span className="detail-value">{forecast.windDirection}°</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="detail-row">
+                      <div className="detail-item expanded">
+                        <span className="detail-icon">👁️</span>
+                        <div className="detail-info">
+                          <span className="detail-label">Visibility</span>
+                          <span className="detail-value">{forecast.visibility / 1000} km</span>
+                        </div>
+                      </div>
+                      <div className="detail-item expanded">
+                        <span className="detail-icon">☁️</span>
+                        <div className="detail-info">
+                          <span className="detail-label">Cloudiness</span>
+                          <span className="detail-value">{forecast.cloudiness}%</span>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -415,7 +611,7 @@ const encodeURL = (str) => {
       {loading && (
         <div className="loading-overlay">
           <div className="loading-spinner"></div>
-          <p>Fetching weather data for {city}...</p>
+          <p>Fetching weather data...</p>
         </div>
       )}
     </div>
